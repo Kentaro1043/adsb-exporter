@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -151,6 +152,20 @@ var (
 		Help: "Messages per DF for a given period",
 	}, []string{"period", "df"})
 
+	// CPU metrics (milliseconds)
+	metricsCPUDemod = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "adsb_stats_cpu_demod_ms",
+		Help: "Milliseconds spent doing demodulation (per period)",
+	}, []string{"period"})
+	metricsCPUReader = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "adsb_stats_cpu_reader_ms",
+		Help: "Milliseconds spent reading samples from SDR (per period)",
+	}, []string{"period"})
+	metricsCPUBackground = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "adsb_stats_cpu_background_ms",
+		Help: "Milliseconds spent in background processing (per period)",
+	}, []string{"period"})
+
 	metricAircraftAltBaro = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "adsb_aircraft_alt_baro_feet",
 		Help: "Aircraft barometric altitude (feet)",
@@ -177,11 +192,22 @@ var (
 	}, []string{"hex", "flight", "category"})
 )
 
+// previous aircraft labels tracking for deletion of stale metrics
+var (
+	prevAircraftLabelsMu sync.Mutex
+	prevAircraftLabels   = map[string]prometheus.Labels{}
+)
+
 func init() {
 	prometheus.MustRegister(metricsMessages)
 	prometheus.MustRegister(metricsLocalModes)
 	prometheus.MustRegister(metricsLocalBad)
 	prometheus.MustRegister(metricsMessagesByDF)
+
+	// register CPU metrics
+	prometheus.MustRegister(metricsCPUDemod)
+	prometheus.MustRegister(metricsCPUReader)
+	prometheus.MustRegister(metricsCPUBackground)
 
 	prometheus.MustRegister(metricAircraftAltBaro)
 	prometheus.MustRegister(metricAircraftRssi)
@@ -226,6 +252,12 @@ func applyStatsPeriod(name string, p *StatsPeriod) {
 		metricsLocalModes.WithLabelValues(name).Set(float64(p.Local.Modes))
 		metricsLocalBad.WithLabelValues(name).Set(float64(p.Local.Bad))
 	}
+	// CPU metrics (if present)
+	if p.CPU != nil {
+		metricsCPUDemod.WithLabelValues(name).Set(float64(p.CPU.Demod))
+		metricsCPUReader.WithLabelValues(name).Set(float64(p.CPU.Reader))
+		metricsCPUBackground.WithLabelValues(name).Set(float64(p.CPU.Background))
+	}
 	if p.MessagesByDF != nil {
 		for i, v := range p.MessagesByDF {
 			metricsMessagesByDF.WithLabelValues(name, strconv.Itoa(i)).Set(float64(v))
@@ -243,15 +275,23 @@ func updateAircraftsFromFile(path string) error {
 		return fmt.Errorf("unmarshal aircrafts: %w", err)
 	}
 
+	// build current label set
+	cur := map[string]prometheus.Labels{}
+
 	for _, ac := range a.Aircraft {
 		hex := ac.Hex
 		flight := ac.Flight
 		category := ac.Category
 
 		labels := prometheus.Labels{"hex": hex, "flight": flight, "category": category}
+		key := hex + "|" + flight + "|" + category
+		cur[key] = labels
 
 		if n, ok := numericFromInterface(ac.AltBaro); ok {
 			metricAircraftAltBaro.With(labels).Set(n)
+		} else {
+			// If no alt_baro, try to reset to 0 to avoid stale values (optional)
+			// metricAircraftAltBaro.With(labels).Set(0)
 		}
 		if ac.RSSI != nil {
 			metricAircraftRssi.With(labels).Set(*ac.RSSI)
@@ -266,6 +306,27 @@ func updateAircraftsFromFile(path string) error {
 			metricAircraftLon.With(labels).Set(*ac.Lon)
 		}
 	}
+
+	// delete stale labels that were present previously but not in current set
+	prevAircraftLabelsMu.Lock()
+	defer prevAircraftLabelsMu.Unlock()
+
+	for k, labels := range prevAircraftLabels {
+		if _, ok := cur[k]; !ok {
+			metricAircraftAltBaro.Delete(labels)
+			metricAircraftRssi.Delete(labels)
+			metricAircraftGS.Delete(labels)
+			metricAircraftLat.Delete(labels)
+			metricAircraftLon.Delete(labels)
+			delete(prevAircraftLabels, k)
+		}
+	}
+
+	// replace previous set with current
+	for k, v := range cur {
+		prevAircraftLabels[k] = v
+	}
+
 	return nil
 }
 
