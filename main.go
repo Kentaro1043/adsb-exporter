@@ -29,6 +29,7 @@ type StatsPeriod struct {
 	Tracks       map[string]int `json:"tracks,omitempty"`
 	Messages     int            `json:"messages,omitempty"`
 	MessagesByDF []int          `json:"messages_by_df,omitempty"`
+	Adaptive     *AdaptiveStats `json:"adaptive,omitempty"`
 }
 
 type LocalStats struct {
@@ -69,6 +70,18 @@ type CPRStats struct {
 	LocalRange       int64 `json:"local_range,omitempty"`
 	LocalSpeed       int64 `json:"local_speed,omitempty"`
 	Filtered         int64 `json:"filtered,omitempty"`
+}
+
+// Adaptive gain stats (see README-json.md)
+type AdaptiveStats struct {
+	GainDB              *float64 `json:"gain_db,omitempty"`
+	DynamicRangeLimitDB *float64 `json:"dynamic_range_limit_db,omitempty"`
+	GainChanges         *int64   `json:"gain_changes,omitempty"`
+	LoudUndecoded       *int64   `json:"loud_undecoded,omitempty"`
+	LoudDecoded         *int64   `json:"loud_decoded,omitempty"`
+	NoiseDBFS           *float64 `json:"noise_dbfs,omitempty"`
+	// gain_seconds keyed by integer gain step; value is [gain_db (float), seconds (number)]
+	GainSeconds map[string][]interface{} `json:"gain_seconds,omitempty"`
 }
 
 type Stats struct {
@@ -166,6 +179,43 @@ var (
 		Help: "Milliseconds spent in background processing (per period)",
 	}, []string{"period"})
 
+	// local gain
+	metricsLocalGainDB = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "adsb_stats_local_gain_db",
+		Help: "SDR gain reported under stats.local.gain_db (dB)",
+	}, []string{"period"})
+
+	// adaptive metrics
+	metricsAdaptiveGainDB = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "adsb_stats_adaptive_gain_db",
+		Help: "Adaptive latest SDR gain (legacy; prefer local.gain_db) (dB)",
+	}, []string{"period"})
+	metricsAdaptiveDynamicRangeLimitDB = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "adsb_stats_adaptive_dynamic_range_limit_db",
+		Help: "Adaptive dynamic range limit (dB)",
+	}, []string{"period"})
+	metricsAdaptiveGainChanges = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "adsb_stats_adaptive_gain_changes_total",
+		Help: "Number of adaptive gain changes in this period",
+	}, []string{"period"})
+	metricsAdaptiveLoudUndecoded = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "adsb_stats_adaptive_loud_undecoded_total",
+		Help: "Number of loud undecoded bursts seen",
+	}, []string{"period"})
+	metricsAdaptiveLoudDecoded = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "adsb_stats_adaptive_loud_decoded_total",
+		Help: "Number of loud decoded messages seen",
+	}, []string{"period"})
+	metricsAdaptiveNoiseDBFS = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "adsb_stats_adaptive_noise_dbfs",
+		Help: "Adaptive noise floor estimate (dBFS)",
+	}, []string{"period"})
+	// gain_seconds: period, gain_step, gain_db -> seconds
+	metricsAdaptiveGainSeconds = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "adsb_stats_adaptive_gain_seconds",
+		Help: "Number of seconds spent at a given adaptive gain step",
+	}, []string{"period", "gain_step", "gain_db"})
+
 	metricAircraftAltBaro = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "adsb_aircraft_alt_baro_feet",
 		Help: "Aircraft barometric altitude (feet)",
@@ -190,6 +240,15 @@ var (
 		Name: "adsb_aircraft_lon",
 		Help: "Aircraft longitude",
 	}, []string{"hex", "flight", "category"})
+
+	metricAircraftNavQNH = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "adsb_aircraft_nav_qnh_hpa",
+		Help: "Aircraft nav QNH (hPa)",
+	}, []string{"hex", "flight", "category"})
+	metricAircraftNavHeading = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "adsb_aircraft_nav_heading_deg",
+		Help: "Aircraft selected nav heading (degrees)",
+	}, []string{"hex", "flight", "category"})
 )
 
 // previous aircraft labels tracking for deletion of stale metrics
@@ -209,11 +268,23 @@ func init() {
 	prometheus.MustRegister(metricsCPUReader)
 	prometheus.MustRegister(metricsCPUBackground)
 
+	// register local/adaptive metrics
+	prometheus.MustRegister(metricsLocalGainDB)
+	prometheus.MustRegister(metricsAdaptiveGainDB)
+	prometheus.MustRegister(metricsAdaptiveDynamicRangeLimitDB)
+	prometheus.MustRegister(metricsAdaptiveGainChanges)
+	prometheus.MustRegister(metricsAdaptiveLoudUndecoded)
+	prometheus.MustRegister(metricsAdaptiveLoudDecoded)
+	prometheus.MustRegister(metricsAdaptiveNoiseDBFS)
+	prometheus.MustRegister(metricsAdaptiveGainSeconds)
+
 	prometheus.MustRegister(metricAircraftAltBaro)
 	prometheus.MustRegister(metricAircraftRssi)
 	prometheus.MustRegister(metricAircraftGS)
 	prometheus.MustRegister(metricAircraftLat)
 	prometheus.MustRegister(metricAircraftLon)
+	prometheus.MustRegister(metricAircraftNavQNH)
+	prometheus.MustRegister(metricAircraftNavHeading)
 }
 
 func safeReadFile(path string) ([]byte, error) {
@@ -251,12 +322,46 @@ func applyStatsPeriod(name string, p *StatsPeriod) {
 	if p.Local != nil {
 		metricsLocalModes.WithLabelValues(name).Set(float64(p.Local.Modes))
 		metricsLocalBad.WithLabelValues(name).Set(float64(p.Local.Bad))
+		if p.Local.GainDB != nil {
+			metricsLocalGainDB.WithLabelValues(name).Set(*p.Local.GainDB)
+		}
 	}
 	// CPU metrics (if present)
 	if p.CPU != nil {
 		metricsCPUDemod.WithLabelValues(name).Set(float64(p.CPU.Demod))
 		metricsCPUReader.WithLabelValues(name).Set(float64(p.CPU.Reader))
 		metricsCPUBackground.WithLabelValues(name).Set(float64(p.CPU.Background))
+	}
+	// adaptive metrics
+	if p.Adaptive != nil {
+		if p.Adaptive.GainDB != nil {
+			metricsAdaptiveGainDB.WithLabelValues(name).Set(*p.Adaptive.GainDB)
+		}
+		if p.Adaptive.DynamicRangeLimitDB != nil {
+			metricsAdaptiveDynamicRangeLimitDB.WithLabelValues(name).Set(*p.Adaptive.DynamicRangeLimitDB)
+		}
+		if p.Adaptive.GainChanges != nil {
+			metricsAdaptiveGainChanges.WithLabelValues(name).Set(float64(*p.Adaptive.GainChanges))
+		}
+		if p.Adaptive.LoudUndecoded != nil {
+			metricsAdaptiveLoudUndecoded.WithLabelValues(name).Set(float64(*p.Adaptive.LoudUndecoded))
+		}
+		if p.Adaptive.LoudDecoded != nil {
+			metricsAdaptiveLoudDecoded.WithLabelValues(name).Set(float64(*p.Adaptive.LoudDecoded))
+		}
+		if p.Adaptive.NoiseDBFS != nil {
+			metricsAdaptiveNoiseDBFS.WithLabelValues(name).Set(*p.Adaptive.NoiseDBFS)
+		}
+		// gain_seconds: map[string][]interface{} -> [gain_db, seconds]
+		for step, arr := range p.Adaptive.GainSeconds {
+			if len(arr) >= 2 {
+				if g, ok := numericFromInterface(arr[0]); ok {
+					if secs, ok2 := numericFromInterface(arr[1]); ok2 {
+						metricsAdaptiveGainSeconds.WithLabelValues(name, step, fmt.Sprintf("%v", g)).Set(secs)
+					}
+				}
+			}
+		}
 	}
 	if p.MessagesByDF != nil {
 		for i, v := range p.MessagesByDF {
@@ -304,6 +409,13 @@ func updateAircraftsFromFile(path string) error {
 		}
 		if ac.Lon != nil {
 			metricAircraftLon.With(labels).Set(*ac.Lon)
+		}
+		// nav fields
+		if ac.NavQNH != nil {
+			metricAircraftNavQNH.With(labels).Set(*ac.NavQNH)
+		}
+		if ac.NavHeading != nil {
+			metricAircraftNavHeading.With(labels).Set(*ac.NavHeading)
 		}
 	}
 
