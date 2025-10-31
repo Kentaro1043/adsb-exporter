@@ -388,11 +388,21 @@ var (
 		Help: "Total messages received from aircraft",
 	}, []string{"hex", "flight", "category"})
 
-	// Info metrics for string fields
-	metricAircraftInfo = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "adsb_aircraft_info",
-		Help: "Aircraft information (squawk, emergency, type, sil_type)",
-	}, []string{"hex", "flight", "category", "squawk", "emergency", "type", "sil_type"})
+	// Info metrics for string fields (as separate label-based metrics)
+	metricAircraftSquawk = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "adsb_aircraft_squawk_info",
+		Help: "Aircraft squawk code (transponder code)",
+	}, []string{"hex", "flight", "category", "squawk"})
+
+	metricAircraftEmergency = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "adsb_aircraft_emergency_info",
+		Help: "Aircraft emergency status",
+	}, []string{"hex", "flight", "category", "emergency"})
+
+	metricAircraftSILTypeInfo = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "adsb_aircraft_sil_type_info",
+		Help: "Aircraft SIL type interpretation",
+	}, []string{"hex", "flight", "category", "sil_type"})
 
 	// Stats metrics - Local stats additional fields
 	metricsLocalSamplesProcessed = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -631,7 +641,9 @@ func init() {
 	prometheus.MustRegister(metricAircraftSeenPos)
 	prometheus.MustRegister(metricAircraftSeen)
 	prometheus.MustRegister(metricAircraftMessages)
-	prometheus.MustRegister(metricAircraftInfo)
+	prometheus.MustRegister(metricAircraftSquawk)
+	prometheus.MustRegister(metricAircraftEmergency)
+	prometheus.MustRegister(metricAircraftSILTypeInfo)
 
 	// register additional local stats
 	prometheus.MustRegister(metricsLocalSamplesProcessed)
@@ -1003,17 +1015,36 @@ func updateAircraftsFromFile(path string) error {
 			metricAircraftRssi.With(labels).Set(*ac.RSSI)
 		}
 
-		// Info metric for string fields
-		infoLabels := prometheus.Labels{
-			"hex":       hex,
-			"flight":    flight,
-			"category":  category,
-			"squawk":    ac.Squawk,
-			"emergency": ac.Emergency,
-			"type":      "",
-			"sil_type":  ac.SILType,
+		// Info metrics for string fields (as separate metrics)
+		if ac.Squawk != "" {
+			squawkLabels := prometheus.Labels{
+				"hex":      hex,
+				"flight":   flight,
+				"category": category,
+				"squawk":   ac.Squawk,
+			}
+			metricAircraftSquawk.With(squawkLabels).Set(1)
 		}
-		metricAircraftInfo.With(infoLabels).Set(1)
+
+		if ac.Emergency != "" {
+			emergencyLabels := prometheus.Labels{
+				"hex":       hex,
+				"flight":    flight,
+				"category":  category,
+				"emergency": ac.Emergency,
+			}
+			metricAircraftEmergency.With(emergencyLabels).Set(1)
+		}
+
+		if ac.SILType != "" {
+			silTypeLabels := prometheus.Labels{
+				"hex":      hex,
+				"flight":   flight,
+				"category": category,
+				"sil_type": ac.SILType,
+			}
+			metricAircraftSILTypeInfo.With(silTypeLabels).Set(1)
+		}
 	}
 
 	// delete stale labels that were present previously but not in current set
